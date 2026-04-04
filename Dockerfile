@@ -9,7 +9,7 @@ RUN CGO_ENABLED=0 GOOS=linux go build -o wa-gateway .
 
 # Build wacli from source (no Linux binary in releases)
 RUN apk add --no-cache git && \
-    go install github.com/steipete/wacli@latest
+    go install github.com/steipete/wacli/cmd/wacli@latest
 
 FROM alpine:3.20
 
