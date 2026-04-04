@@ -32,6 +32,14 @@ type WacliMessage struct {
 	Snippet     string `json:"Snippet"`
 }
 
+// wacli messages list --json response wrapper
+type WacliMessagesResponse struct {
+	Success bool `json:"success"`
+	Data    struct {
+		Messages []WacliMessage `json:"messages"`
+	} `json:"data"`
+}
+
 // Payload we POST to OtterClawd
 type WebhookPayload struct {
 	From      string `json:"from"`
@@ -62,10 +70,15 @@ var (
 		connected bool
 		lastMsg   time.Time
 	}
+	// Track which messages we've already forwarded
+	seenMessages struct {
+		mu  sync.RWMutex
+		ids map[string]bool
+	}
 	// JID cache: maps @lid JIDs to phone numbers via wacli chats list
 	jidCache struct {
 		mu      sync.RWMutex
-		mapping map[string]string // "120980773056584@lid" → "+6591234567"
+		mapping map[string]string
 		updated time.Time
 	}
 )
@@ -104,6 +117,7 @@ func loadConfig() Config {
 func main() {
 	config = loadConfig()
 	jidCache.mapping = make(map[string]string)
+	seenMessages.ids = make(map[string]bool)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -120,8 +134,14 @@ func main() {
 	// Build initial JID cache
 	refreshJIDCache()
 
-	// Start wacli sync in background
+	// Seed seen messages with existing messages so we don't replay history
+	seedSeenMessages()
+
+	// Start wacli sync in background (keeps WhatsApp connection alive)
 	go runSync(ctx)
+
+	// Poll for new messages every 2 seconds
+	go pollMessages(ctx)
 
 	// Periodically refresh JID cache (every 10 min)
 	go func() {
@@ -133,6 +153,20 @@ func main() {
 				return
 			case <-ticker.C:
 				refreshJIDCache()
+			}
+		}
+	}()
+
+	// Prune seen messages cache every hour to prevent memory leak
+	go func() {
+		ticker := time.NewTicker(1 * time.Hour)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				pruneSeenMessages()
 			}
 		}
 	}()
@@ -164,14 +198,38 @@ func main() {
 }
 
 // ═══════════════════════════════════════════════════════
+// SEEN MESSAGES TRACKING
+// ═══════════════════════════════════════════════════════
+
+func seedSeenMessages() {
+	// Mark all existing messages as seen so we don't replay on startup
+	msgs := fetchRecentMessages(100)
+	seenMessages.mu.Lock()
+	for _, msg := range msgs {
+		seenMessages.ids[msg.MsgID] = true
+	}
+	seenMessages.mu.Unlock()
+	log.Printf("Seeded %d existing messages as seen", len(msgs))
+}
+
+func pruneSeenMessages() {
+	seenMessages.mu.Lock()
+	// Keep max 10000 entries
+	if len(seenMessages.ids) > 10000 {
+		seenMessages.ids = make(map[string]bool)
+		log.Println("Pruned seen messages cache")
+	}
+	seenMessages.mu.Unlock()
+}
+
+// ═══════════════════════════════════════════════════════
 // JID RESOLUTION: @lid → phone number
 // ═══════════════════════════════════════════════════════
 
-// WacliChat represents a chat entry from `wacli chats list --json`
 type WacliChat struct {
 	JID   string `json:"JID"`
 	Name  string `json:"Name"`
-	Phone string `json:"Phone"` // may or may not exist
+	Phone string `json:"Phone"`
 }
 
 func refreshJIDCache() {
@@ -182,14 +240,26 @@ func refreshJIDCache() {
 		return
 	}
 
+	// wacli wraps in {"success":true,"data":{...}}
+	var wrapper struct {
+		Success bool `json:"success"`
+		Data    struct {
+			Chats []WacliChat `json:"chats"`
+		} `json:"data"`
+	}
+
 	var chats []WacliChat
-	if err := json.Unmarshal(output, &chats); err != nil {
-		// Try parsing as JSON lines
-		scanner := bufio.NewScanner(bytes.NewReader(output))
-		for scanner.Scan() {
-			var chat WacliChat
-			if json.Unmarshal(scanner.Bytes(), &chat) == nil {
-				chats = append(chats, chat)
+	if err := json.Unmarshal(output, &wrapper); err == nil && wrapper.Success {
+		chats = wrapper.Data.Chats
+	} else {
+		// Fallback: try as bare array or JSON lines
+		if err := json.Unmarshal(output, &chats); err != nil {
+			scanner := bufio.NewScanner(bytes.NewReader(output))
+			for scanner.Scan() {
+				var chat WacliChat
+				if json.Unmarshal(scanner.Bytes(), &chat) == nil {
+					chats = append(chats, chat)
+				}
 			}
 		}
 	}
@@ -198,17 +268,14 @@ func refreshJIDCache() {
 	defer jidCache.mu.Unlock()
 
 	for _, chat := range chats {
-		// If JID is @s.whatsapp.net, the number prefix IS the phone
 		if strings.HasSuffix(chat.JID, "@s.whatsapp.net") {
 			phone := strings.TrimSuffix(chat.JID, "@s.whatsapp.net")
 			phone = strings.Split(phone, ":")[0]
 			if !strings.HasPrefix(phone, "+") {
 				phone = "+" + phone
 			}
-			// Map both the @s JID and any @lid that maps to same contact
 			jidCache.mapping[chat.JID] = phone
 		}
-		// If chat has a Phone field, use it directly
 		if chat.Phone != "" {
 			phone := chat.Phone
 			if !strings.HasPrefix(phone, "+") {
@@ -222,9 +289,7 @@ func refreshJIDCache() {
 	log.Printf("JID cache refreshed: %d entries", len(jidCache.mapping))
 }
 
-// resolveJID converts any JID format to a phone number or returns the raw JID
 func resolveJID(jid string) string {
-	// @s.whatsapp.net → direct phone extraction
 	if strings.HasSuffix(jid, "@s.whatsapp.net") {
 		phone := strings.TrimSuffix(jid, "@s.whatsapp.net")
 		phone = strings.Split(phone, ":")[0]
@@ -234,7 +299,6 @@ func resolveJID(jid string) string {
 		return phone
 	}
 
-	// @g.us → group, return as-is
 	if strings.HasSuffix(jid, "@g.us") {
 		return jid
 	}
@@ -258,16 +322,15 @@ func resolveJID(jid string) string {
 		return phone
 	}
 
-	// Still unresolved — pass the raw JID through
-	// OtterClawd's normalizer will need to handle or ignore it
 	log.Printf("WARNING: Could not resolve JID %s to phone number", jid)
 	return jid
 }
 
 // ═══════════════════════════════════════════════════════
-// INBOUND: wacli sync → parse → webhook
+// INBOUND: wacli sync (background) + poll messages list
 // ═══════════════════════════════════════════════════════
 
+// runSync keeps the WhatsApp connection alive — messages go to SQLite
 func runSync(ctx context.Context) {
 	for {
 		select {
@@ -277,16 +340,10 @@ func runSync(ctx context.Context) {
 		}
 
 		log.Println("Starting wacli sync...")
-		cmd := exec.CommandContext(ctx, "wacli", "sync", "--follow", "--json",
+		cmd := exec.CommandContext(ctx, "wacli", "sync", "--follow",
 			"--store", config.WacliStore)
+		cmd.Stdout = os.Stdout
 		cmd.Stderr = os.Stderr
-
-		stdout, err := cmd.StdoutPipe()
-		if err != nil {
-			log.Printf("Failed to create stdout pipe: %v", err)
-			time.Sleep(5 * time.Second)
-			continue
-		}
 
 		if err := cmd.Start(); err != nil {
 			log.Printf("Failed to start wacli sync: %v", err)
@@ -298,46 +355,82 @@ func runSync(ctx context.Context) {
 		syncStatus.connected = true
 		syncStatus.mu.Unlock()
 
-		scanner := bufio.NewScanner(stdout)
-		scanner.Buffer(make([]byte, 256*1024), 256*1024) // 256KB buffer
-
-		for scanner.Scan() {
-			line := scanner.Bytes()
-			if len(line) == 0 {
-				continue
-			}
-			// Copy line since scanner reuses the buffer
-			msg := make([]byte, len(line))
-			copy(msg, line)
-			go processMessage(msg)
-		}
+		cmd.Wait()
 
 		syncStatus.mu.Lock()
 		syncStatus.connected = false
 		syncStatus.mu.Unlock()
-
-		if err := cmd.Wait(); err != nil {
-			log.Printf("wacli sync exited: %v", err)
-		}
 
 		log.Println("wacli sync ended, restarting in 5s...")
 		time.Sleep(5 * time.Second)
 	}
 }
 
-func processMessage(raw []byte) {
-	var msg WacliMessage
-	if err := json.Unmarshal(raw, &msg); err != nil {
-		log.Printf("Failed to parse wacli message: %v — raw: %s", err, string(raw))
-		return
+// pollMessages checks for new messages every 2s via wacli messages list
+func pollMessages(ctx context.Context) {
+	// Wait for sync to connect first
+	time.Sleep(5 * time.Second)
+
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			msgs := fetchRecentMessages(20)
+			for _, msg := range msgs {
+				// Skip already-seen
+				seenMessages.mu.RLock()
+				seen := seenMessages.ids[msg.MsgID]
+				seenMessages.mu.RUnlock()
+				if seen {
+					continue
+				}
+
+				// Mark as seen
+				seenMessages.mu.Lock()
+				seenMessages.ids[msg.MsgID] = true
+				seenMessages.mu.Unlock()
+
+				// Process in background
+				go processMessage(msg)
+			}
+		}
+	}
+}
+
+func fetchRecentMessages(limit int) []WacliMessage {
+	cmd := exec.Command("wacli", "messages", "list",
+		"--json",
+		"--limit", fmt.Sprintf("%d", limit),
+		"--store", config.WacliStore)
+	output, err := cmd.Output()
+	if err != nil {
+		// Don't log every poll failure — wacli might be busy
+		return nil
 	}
 
+	var resp WacliMessagesResponse
+	if err := json.Unmarshal(output, &resp); err != nil {
+		return nil
+	}
+
+	if !resp.Success {
+		return nil
+	}
+
+	return resp.Data.Messages
+}
+
+func processMessage(msg WacliMessage) {
 	// Skip our own outbound messages
 	if msg.FromMe {
 		return
 	}
 
-	// Skip non-text messages for now
+	// Skip non-text messages
 	text := msg.Text
 	if text == "" {
 		text = msg.DisplayText
@@ -349,7 +442,6 @@ func processMessage(raw []byte) {
 	// Determine chat type
 	chatType := "dm"
 	groupID := ""
-
 	if strings.HasSuffix(msg.ChatJID, "@g.us") {
 		chatType = "group"
 		groupID = msg.ChatJID
@@ -361,18 +453,27 @@ func processMessage(raw []byte) {
 	payload := WebhookPayload{
 		From:      from,
 		Text:      text,
-		PushName:  msg.ChatName, // wacli gives ChatName, not PushName
+		PushName:  msg.ChatName,
 		ChatType:  chatType,
 		GroupID:   groupID,
 		MessageID: msg.MsgID,
-		Timestamp: msg.Timestamp, // Already RFC3339
+		Timestamp: msg.Timestamp,
 	}
+
+	log.Printf("New message from %s: %s", from, truncate(text, 50))
 
 	syncStatus.mu.Lock()
 	syncStatus.lastMsg = time.Now()
 	syncStatus.mu.Unlock()
 
 	postToWebhook(payload)
+}
+
+func truncate(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "..."
 }
 
 func postToWebhook(payload WebhookPayload) {
@@ -403,6 +504,8 @@ func postToWebhook(payload WebhookPayload) {
 	if resp.StatusCode >= 400 {
 		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
 		log.Printf("Webhook returned %d: %s", resp.StatusCode, string(respBody))
+	} else {
+		log.Printf("Webhook delivered: %s → %d", payload.MessageID, resp.StatusCode)
 	}
 }
 
@@ -416,7 +519,6 @@ func handleSend(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Verify bearer token
 	auth := r.Header.Get("Authorization")
 	if auth != "Bearer "+config.APIToken {
 		writeJSON(w, http.StatusUnauthorized, SendResponse{Error: "Unauthorized"})
@@ -434,7 +536,6 @@ func handleSend(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Execute wacli send
 	cmd := exec.Command("wacli", "send", "text",
 		"--to", req.To,
 		"--message", req.Text,
@@ -454,14 +555,12 @@ func handleSend(w http.ResponseWriter, r *http.Request) {
 	var result map[string]interface{}
 	messageID := ""
 	if err := json.Unmarshal(output, &result); err == nil {
-		// Try common field names (PascalCase per wacli convention)
 		for _, key := range []string{"MsgID", "MessageID", "msg_id", "messageId"} {
 			if id, ok := result[key].(string); ok && id != "" {
 				messageID = id
 				break
 			}
 		}
-		// Try nested data object
 		if messageID == "" {
 			if data, ok := result["data"].(map[string]interface{}); ok {
 				for _, key := range []string{"MsgID", "MessageID", "msg_id"} {
@@ -495,6 +594,10 @@ func handleStatus(w http.ResponseWriter, r *http.Request) {
 	cacheUpdated := jidCache.updated
 	jidCache.mu.RUnlock()
 
+	seenMessages.mu.RLock()
+	seenCount := len(seenMessages.ids)
+	seenMessages.mu.RUnlock()
+
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"connected": connected,
 		"lastMessage": func() string {
@@ -503,6 +606,7 @@ func handleStatus(w http.ResponseWriter, r *http.Request) {
 			}
 			return lastMsg.UTC().Format(time.RFC3339)
 		}(),
+		"seenMessages": seenCount,
 		"jidCache": map[string]interface{}{
 			"entries": cacheSize,
 			"updated": func() string {
