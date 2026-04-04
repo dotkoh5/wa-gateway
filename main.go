@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -49,7 +48,6 @@ type WebhookPayload struct {
 	GroupID   string `json:"groupId,omitempty"`
 	MessageID string `json:"messageId,omitempty"`
 	Timestamp string `json:"timestamp,omitempty"`
-	ReplyTo   string `json:"replyTo,omitempty"`
 }
 
 type SendRequest struct {
@@ -73,20 +71,12 @@ var (
 		lastSync  time.Time
 	}
 
-	// Track which messages we've already forwarded
 	seenMessages struct {
 		mu  sync.RWMutex
 		ids map[string]bool
 	}
 
-	// JID cache: maps @lid JIDs to phone numbers
-	jidCache struct {
-		mu      sync.RWMutex
-		mapping map[string]string
-		updated time.Time
-	}
-
-	// Store lock: serialize all wacli commands so they don't conflict
+	// Serialize all wacli commands
 	storeLock sync.Mutex
 )
 
@@ -123,7 +113,6 @@ func loadConfig() Config {
 
 func main() {
 	config = loadConfig()
-	jidCache.mapping = make(map[string]string)
 	seenMessages.ids = make(map[string]bool)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -137,37 +126,16 @@ func main() {
 		cancel()
 	}()
 
-	// Initial sync to pull messages + connect
+	// Initial sync
 	log.Println("Running initial sync...")
 	runSyncOnce()
-
-	// Build JID cache
-	refreshJIDCache()
 
 	// Seed seen messages so we don't replay history
 	seedSeenMessages()
 
-	// Periodic sync (every 3s) — keeps connection alive + pulls new messages
+	// Periodic sync + poll
 	go syncLoop(ctx)
-
-	// Check for new messages after each sync (every 3s, offset from sync)
 	go pollLoop(ctx)
-
-	// Refresh JID cache every 10 min
-	go func() {
-		ticker := time.NewTicker(10 * time.Minute)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				storeLock.Lock()
-				refreshJIDCache()
-				storeLock.Unlock()
-			}
-		}
-	}()
 
 	// Prune seen messages every hour
 	go func() {
@@ -210,7 +178,7 @@ func main() {
 }
 
 // ═══════════════════════════════════════════════════════
-// SYNC: periodic wacli sync --once
+// SYNC
 // ═══════════════════════════════════════════════════════
 
 func runSyncOnce() {
@@ -240,7 +208,6 @@ func runSyncOnce() {
 func syncLoop(ctx context.Context) {
 	ticker := time.NewTicker(3 * time.Second)
 	defer ticker.Stop()
-
 	for {
 		select {
 		case <-ctx.Done():
@@ -252,16 +219,13 @@ func syncLoop(ctx context.Context) {
 }
 
 // ═══════════════════════════════════════════════════════
-// POLL: check for new messages after sync
+// POLL
 // ═══════════════════════════════════════════════════════
 
 func pollLoop(ctx context.Context) {
-	// Offset by 1.5s so we poll between syncs
 	time.Sleep(1500 * time.Millisecond)
-
 	ticker := time.NewTicker(3 * time.Second)
 	defer ticker.Stop()
-
 	for {
 		select {
 		case <-ctx.Done():
@@ -314,7 +278,7 @@ func fetchRecentMessages(limit int) []WacliMessage {
 }
 
 // ═══════════════════════════════════════════════════════
-// SEEN MESSAGES TRACKING
+// SEEN MESSAGES
 // ═══════════════════════════════════════════════════════
 
 func seedSeenMessages() {
@@ -337,104 +301,23 @@ func pruneSeenMessages() {
 }
 
 // ═══════════════════════════════════════════════════════
-// JID RESOLUTION
+// JID → from identifier
 // ═══════════════════════════════════════════════════════
 
-type WacliChat struct {
-	JID   string `json:"JID"`
-	Name  string `json:"Name"`
-	Phone string `json:"Phone"`
-}
-
-func refreshJIDCache() {
-	cmd := exec.Command("wacli", "chats", "list", "--json", "--store", config.WacliStore)
-	output, err := cmd.Output()
-	if err != nil {
-		log.Printf("Failed to refresh JID cache: %v", err)
-		return
-	}
-
-	var wrapper struct {
-		Success bool `json:"success"`
-		Data    struct {
-			Chats []WacliChat `json:"chats"`
-		} `json:"data"`
-	}
-
-	var chats []WacliChat
-	if err := json.Unmarshal(output, &wrapper); err == nil && wrapper.Success {
-		chats = wrapper.Data.Chats
-	} else {
-		if err := json.Unmarshal(output, &chats); err != nil {
-			scanner := bufio.NewScanner(bytes.NewReader(output))
-			for scanner.Scan() {
-				var chat WacliChat
-				if json.Unmarshal(scanner.Bytes(), &chat) == nil {
-					chats = append(chats, chat)
-				}
-			}
-		}
-	}
-
-	jidCache.mu.Lock()
-	defer jidCache.mu.Unlock()
-
-	for _, chat := range chats {
-		if strings.HasSuffix(chat.JID, "@s.whatsapp.net") {
-			phone := strings.TrimSuffix(chat.JID, "@s.whatsapp.net")
-			phone = strings.Split(phone, ":")[0]
-			if !strings.HasPrefix(phone, "+") {
-				phone = "+" + phone
-			}
-			jidCache.mapping[chat.JID] = phone
-		}
-		if chat.Phone != "" {
-			phone := chat.Phone
-			if !strings.HasPrefix(phone, "+") {
-				phone = "+" + phone
-			}
-			jidCache.mapping[chat.JID] = phone
-		}
-	}
-
-	jidCache.updated = time.Now()
-	log.Printf("JID cache refreshed: %d entries", len(jidCache.mapping))
-}
-
-func resolveJID(jid string) string {
+// normalizeJID converts @s.whatsapp.net JIDs to E.164 phone numbers.
+// @lid JIDs pass through as-is (WhatsApp's newer privacy format —
+// no phone number embedded). OtterClawd stores and matches on whatever
+// identifier is returned.
+func normalizeJID(jid string) string {
 	if strings.HasSuffix(jid, "@s.whatsapp.net") {
 		phone := strings.TrimSuffix(jid, "@s.whatsapp.net")
-		phone = strings.Split(phone, ":")[0]
-		if !strings.HasPrefix(phone, "+") {
+		phone = strings.Split(phone, ":")[0] // strip device suffix
+		if phone != "" && phone != "0" && !strings.HasPrefix(phone, "+") {
 			phone = "+" + phone
 		}
 		return phone
 	}
-
-	if strings.HasSuffix(jid, "@g.us") {
-		return jid
-	}
-
-	jidCache.mu.RLock()
-	phone, ok := jidCache.mapping[jid]
-	jidCache.mu.RUnlock()
-	if ok {
-		return phone
-	}
-
-	log.Printf("JID cache miss for %s, refreshing...", jid)
-	storeLock.Lock()
-	refreshJIDCache()
-	storeLock.Unlock()
-
-	jidCache.mu.RLock()
-	phone, ok = jidCache.mapping[jid]
-	jidCache.mu.RUnlock()
-	if ok {
-		return phone
-	}
-
-	log.Printf("WARNING: Could not resolve JID %s to phone number", jid)
+	// @lid, @g.us, etc. → pass through as-is
 	return jid
 }
 
@@ -462,7 +345,7 @@ func processMessage(msg WacliMessage) {
 		groupID = msg.ChatJID
 	}
 
-	from := resolveJID(msg.SenderJID)
+	from := normalizeJID(msg.SenderJID)
 
 	payload := WebhookPayload{
 		From:      from,
@@ -550,7 +433,6 @@ func handleSend(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Acquire store lock so send doesn't conflict with sync
 	storeLock.Lock()
 	cmd := exec.Command("wacli", "send", "text",
 		"--to", req.To,
@@ -607,11 +489,6 @@ func handleStatus(w http.ResponseWriter, r *http.Request) {
 	lastSync := syncStatus.lastSync
 	syncStatus.mu.RUnlock()
 
-	jidCache.mu.RLock()
-	cacheSize := len(jidCache.mapping)
-	cacheUpdated := jidCache.updated
-	jidCache.mu.RUnlock()
-
 	seenMessages.mu.RLock()
 	seenCount := len(seenMessages.ids)
 	seenMessages.mu.RUnlock()
@@ -621,10 +498,6 @@ func handleStatus(w http.ResponseWriter, r *http.Request) {
 		"lastMessage":  fmtTime(lastMsg),
 		"lastSync":     fmtTime(lastSync),
 		"seenMessages": seenCount,
-		"jidCache": map[string]interface{}{
-			"entries": cacheSize,
-			"updated": fmtTime(cacheUpdated),
-		},
 	})
 }
 
