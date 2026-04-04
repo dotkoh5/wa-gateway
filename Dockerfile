@@ -1,22 +1,20 @@
-FROM golang:1.25-alpine AS builder
+FROM golang:1.25 AS builder
 
-# Install build deps for CGO (wacli needs sqlite via cgo)
-RUN apk add --no-cache git gcc musl-dev
+RUN apt-get update && apt-get install -y git gcc
 
-# Build wa-gateway (pure Go, no CGO needed)
+# Build wa-gateway
 WORKDIR /app
 COPY go.mod ./
 RUN go mod download
 COPY . .
-RUN CGO_ENABLED=0 GOOS=linux go build -o wa-gateway .
+RUN CGO_ENABLED=1 go build -o wa-gateway .
 
-# Build wacli with CGO enabled (requires sqlite)
+# Build wacli with CGO (needs sqlite)
 RUN CGO_ENABLED=1 go install github.com/steipete/wacli/cmd/wacli@latest
 
-FROM alpine:3.20
+FROM debian:bookworm-slim
 
-# wacli needs libc for CGO sqlite
-RUN apk add --no-cache ca-certificates
+RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /app/wa-gateway /usr/local/bin/wa-gateway
 COPY --from=builder /go/bin/wacli /usr/local/bin/wacli
@@ -24,5 +22,4 @@ COPY --from=builder /go/bin/wacli /usr/local/bin/wacli
 VOLUME /data/wa-session
 EXPOSE 3100
 
-# No fixed entrypoint — allows running either wa-gateway or wacli
 CMD ["wa-gateway"]
