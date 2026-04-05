@@ -433,6 +433,15 @@ func handleSend(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Convert phone numbers to JID format — wacli can't resolve phone numbers
+	// +6597230147 → 6597230147@s.whatsapp.net
+	// Already a JID (@lid, @s.whatsapp.net, @g.us) → pass through
+	if !strings.Contains(req.To, "@") {
+		digits := strings.TrimLeft(req.To, "+")
+		req.To = digits + "@s.whatsapp.net"
+		log.Printf("Converted phone to JID: %s", req.To)
+	}
+
 	// Try to acquire lock with timeout — don't hang forever waiting for sync
 	locked := false
 	deadline := time.Now().Add(15 * time.Second)
