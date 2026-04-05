@@ -187,7 +187,7 @@ func runSyncOnce() {
 
 	cmd := exec.Command("wacli", "sync", "--once",
 		"--store", config.WacliStore,
-		"--idle-exit", "5s")
+		"--idle-exit", "2s")
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 
@@ -206,7 +206,7 @@ func runSyncOnce() {
 }
 
 func syncLoop(ctx context.Context) {
-	ticker := time.NewTicker(3 * time.Second)
+	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
 	for {
 		select {
@@ -224,7 +224,7 @@ func syncLoop(ctx context.Context) {
 
 func pollLoop(ctx context.Context) {
 	time.Sleep(1500 * time.Millisecond)
-	ticker := time.NewTicker(3 * time.Second)
+	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 	for {
 		select {
@@ -433,7 +433,24 @@ func handleSend(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	storeLock.Lock()
+	// Try to acquire lock with timeout — don't hang forever waiting for sync
+	locked := false
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		if storeLock.TryLock() {
+			locked = true
+			break
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	if !locked {
+		log.Println("Send timed out waiting for store lock")
+		writeJSON(w, http.StatusServiceUnavailable, SendResponse{
+			Error: "Gateway busy — try again in a few seconds",
+		})
+		return
+	}
+
 	cmd := exec.Command("wacli", "send", "text",
 		"--to", req.To,
 		"--message", req.Text,
